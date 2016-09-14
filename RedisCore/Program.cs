@@ -34,9 +34,9 @@ namespace RedisCore
         {
             Thread.CurrentThread.Name = "Main";
 
-            RunTest<NetworkStreamClientChannelFactory>();
+            //RunTest<NetworkStreamClientChannelFactory>();
 
-            //RunTest<SocketConnectionClientChannelFactory>();
+            RunTest<SocketConnectionClientChannelFactory>();
 
             //RunTest<UvClientChannelFactory>();
         }
@@ -146,50 +146,62 @@ namespace RedisCore
 
         private static async void PingAsync(RedisConnection conn)
         {
-            Console.WriteLine();
-            Console.WriteLine($"Sending {PipelinedCount} pings asynchronously fire-and-forget (pipelined) ...");
-            Collect();
-            var timer = Stopwatch.StartNew();
-            // starting at 1 so that we can wait on the last one and still send the right amount
-            for (int i = 1; i < PipelinedCount; i++) await conn.PingAsync(fireAndForget: true);
-            await conn.PingAsync(); // block
-            timer.Stop();
-            Console.WriteLine($"{timer.ElapsedMilliseconds}ms; {((PipelinedCount * 1000.0) / timer.ElapsedMilliseconds):F0} ops/s");
-
-            Console.WriteLine();
-            Console.WriteLine($"Sending {(BatchSize * BatchCount) + 1} pings asynchronously fire-and-forget ({BatchCount} batches of {BatchSize}) ...");
-            Collect();
-            timer = Stopwatch.StartNew();
-
-            Task ignored = null;
-            int total = 0;
-            for (int i = 0; i < BatchCount; i++)
+            try
             {
-                var batch = conn.CreateBatch();
-                for (int j = 0; j < BatchSize; j++)
+                Console.WriteLine();
+                Console.WriteLine($"Sending {PipelinedCount} pings asynchronously fire-and-forget (pipelined) ...");
+                Collect();
+                var timer = Stopwatch.StartNew();
+                // starting at 1 so that we can wait on the last one and still send the right amount
+                for (int i = 1; i < PipelinedCount; i++)
                 {
-                    ignored = batch.PingAysnc(true);
-                    if ((total++ % UpdateUIEvery) == 0) Console.Write('.');
+                    await conn.PingAsync(fireAndForget: true);
+                    if ((i % UpdateUIEvery) == 0) Console.Write('.');
                 }
-                await batch.ExecuteAsync();
-            }
-            await conn.PingAsync(); // block
-            timer.Stop();
-            Console.WriteLine();
-            Console.WriteLine($"{timer.ElapsedMilliseconds}ms; {((((BatchSize * BatchCount) + 1) * 1000.0) / timer.ElapsedMilliseconds):F0} ops/s");
+                Console.WriteLine("waiting for final ping...");
+                await conn.PingAsync(); // block
+                Console.WriteLine("Final ping received...");
+                timer.Stop();
+                Console.WriteLine($"{timer.ElapsedMilliseconds}ms; {((PipelinedCount * 1000.0) / timer.ElapsedMilliseconds):F0} ops/s");
 
-            Console.WriteLine();
-            Console.WriteLine($"Sending {RequestResponseCount} pings asynchronously req/resp/req/resp/...");
-            Collect();
-            timer = Stopwatch.StartNew();
-            for (int i = 0; i < RequestResponseCount; i++)
+                Console.WriteLine();
+                Console.WriteLine($"Sending {(BatchSize * BatchCount) + 1} pings asynchronously fire-and-forget ({BatchCount} batches of {BatchSize}) ...");
+                Collect();
+                timer = Stopwatch.StartNew();
+
+                Task ignored = null;
+                int total = 0;
+                for (int i = 0; i < BatchCount; i++)
+                {
+                    var batch = conn.CreateBatch();
+                    for (int j = 0; j < BatchSize; j++)
+                    {
+                        ignored = batch.PingAysnc(true);
+                        if ((total++ % UpdateUIEvery) == 0) Console.Write('.');
+                    }
+                    await batch.ExecuteAsync();
+                }
+                await conn.PingAsync(); // block
+                timer.Stop();
+                Console.WriteLine();
+                Console.WriteLine($"{timer.ElapsedMilliseconds}ms; {((((BatchSize * BatchCount) + 1) * 1000.0) / timer.ElapsedMilliseconds):F0} ops/s");
+
+                Console.WriteLine();
+                Console.WriteLine($"Sending {RequestResponseCount} pings asynchronously req/resp/req/resp/...");
+                Collect();
+                timer = Stopwatch.StartNew();
+                for (int i = 0; i < RequestResponseCount; i++)
+                {
+                    await conn.PingAsync();
+                    if ((i % UpdateUIEvery) == 0) Console.Write('.');
+                }
+                timer.Stop();
+                Console.WriteLine();
+                Console.WriteLine($"{timer.ElapsedMilliseconds}ms; {((RequestResponseCount * 1000.0) / timer.ElapsedMilliseconds):F0} ops/s");
+            } catch(Exception ex)
             {
-                await conn.PingAsync();
-                if ((i % UpdateUIEvery) == 0) Console.Write('.');
+                Console.Error.WriteLine(ex.Message);
             }
-            timer.Stop();
-            Console.WriteLine();
-            Console.WriteLine($"{timer.ElapsedMilliseconds}ms; {((RequestResponseCount * 1000.0) / timer.ElapsedMilliseconds):F0} ops/s");
         }
 
         [Conditional("DEBUG")]

@@ -52,54 +52,43 @@ namespace RedisCore
             }
         }
 
-        private static Vector<byte> _vectorCRs = new Vector<byte>((byte)'\r'),
-            _unused = new Vector<byte>(0); // to avoid JIT bug in net 452; yes, really
-
         private static bool TryReadLineTerminatedString(ResultType resultType, ref ReadableBuffer buffer, out RawResult result)
         {
-            ReadCursor cr;
-            if (TryFindCRLF(ref buffer, out cr))
+            ReadableBuffer before, after;
+            if (TryFindCRLF(ref buffer, out before, out after))
             {
-                result = new RawResult(resultType, buffer.Slice(1, cr));
-                buffer = buffer.Slice(cr).Slice(2);
+                result = new RawResult(resultType, before.Slice(1));
+                buffer = after;
                 return true;
             }
             result = default(RawResult);
             return false;
         }
-        static bool TryFindCRLF(ref ReadableBuffer buffer, out ReadCursor cr)
+        static bool TryFindCRLF(ref ReadableBuffer buffer, out ReadableBuffer before, out ReadableBuffer after)
         {
-            var seekBuffer = buffer;
-            while (seekBuffer.Length >= 2)
+            ReadCursor index;
+            if(buffer.Length >= 2 && buffer.TrySliceTo((byte)'\r', (byte)'\n', out before, out index))
             {
-                cr = seekBuffer.IndexOf(ref _vectorCRs);
-                if (cr == ReadCursor.NotFound) break;
-
-                // confirm that the LF in the CRLF
-                var tmp = seekBuffer.Slice(cr);
-                if (tmp.StartsWith(RedisConnection.CRLF))
-                {
-                    return true;
-                }
-                // move forwards and keep trying
-                seekBuffer = tmp;
+                after = buffer.Slice(index).Slice(2);
+                return true;
             }
-            cr = default(ReadCursor);
+            before = after = default(ReadableBuffer);
             return false;
         }
+
         static readonly byte[] MinusOne = { (byte)'-', (byte)'1' };
         private static bool TryReadBulkString(ref ReadableBuffer buffer, out RawResult result)
         {
-            ReadCursor cr;
-            if (!TryFindCRLF(ref buffer, out cr))
+            ReadableBuffer before, after;
+            if (!TryFindCRLF(ref buffer, out before, out after))
             {
                 result = default(RawResult);
                 return false;
             }
-            var slice = buffer.Slice(1, cr);
-            if (slice.Peek() == (byte)'-')
+            before = before.Slice(1);
+            if (before.Peek() == (byte)'-')
             {
-                if (slice.Equals(MinusOne))
+                if (before.Equals(MinusOne))
                 {
                     throw new NotImplementedException("Null bulk string");
                     // result = 
@@ -107,28 +96,26 @@ namespace RedisCore
                 }
                 throw new InvalidOperationException("Protocol exception; negative length not expected except -1");
             }
-            var ulen = ReadableBufferExtensions.GetUInt64(slice);
+            var ulen = ReadableBufferExtensions.GetUInt64(before);
             if (ulen > int.MaxValue) throw new OverflowException();
             var len = (int)ulen;
 
             // check that the final CRLF is well formed
-            slice = buffer.Slice(cr).Slice(2);
-            if (slice.Length < len + 2)
+            if (after.Length < len + 2)
             {
                 // not enough data
                 result = default(RawResult);
                 return false;
             }
 
-            var tmp = slice.Slice(len);
-            if (tmp.Peek() != '\r' || tmp.Slice(1).Peek() != '\n')
-            {
+            if(!after.Slice(len, 2).Equals(RedisConnection.CRLF))
+            { 
                 throw new InvalidOperationException("Protocol exception; expected crlf after bulk string");
             }
 
             // all looks good, yay!
-            result = new RawResult(ResultType.BulkString, slice.Slice(0, len));
-            buffer = slice.Slice(len + 2);
+            result = new RawResult(ResultType.BulkString, after.Slice(0, len));
+            buffer = after.Slice(len + 2);
             return true;
         }
 

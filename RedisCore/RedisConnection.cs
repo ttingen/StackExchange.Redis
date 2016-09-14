@@ -57,17 +57,20 @@ namespace RedisCore
     }
     public class RedisConnection : IDisposable
     {
-        internal static readonly byte[] CRLF = { (byte)'\r', (byte)'\n' };
+        internal static readonly byte[]
+            CRLF = { (byte)'\r', (byte)'\n' },
+            Dollar = { (byte)'$' };
         struct PingMessage : IMessage
         {
             public override string ToString() => "PING";
 
-            public void Write(ref WritableBuffer output) => output.Write(ping);
+            public void Write(ref WritableBuffer output) => output.Write(PING_Command);
 
-            static readonly Span<byte> ping = new Span<byte>(Encoding.ASCII.GetBytes("PING\r\n")),
-                PONG = new Span<byte>(Encoding.ASCII.GetBytes("PONG"));
+            static readonly byte[]
+                PING_Command = Encoding.ASCII.GetBytes("PING\r\n"),
+                PONG = Encoding.ASCII.GetBytes("PONG");
 
-            public int MinimumSize => ping.Length;
+            public int MinimumSize => PING_Command.Length;
 
             public static readonly ResultParser<bool> Parser = new PingParser();
             sealed class PingParser : ResultParser<bool>
@@ -126,7 +129,7 @@ namespace RedisCore
             {
                 var ping = new PingMessage();
                 return Add(ref ping, PingMessage.Parser, fireAndForget);
-            } 
+            }
             private Task<TResult> Add<TMessage, TResult>(ref TMessage message, ResultParser<TResult> parser, bool fireAndForget)
                 where TMessage : struct, IMessage
             {
@@ -196,10 +199,10 @@ namespace RedisCore
                 => value.IsString ? StringParser.Instance : ByteArrayParser.Instance;
 
             int IMessage.MinimumSize => 0;
-            static readonly Span<byte>
-                prefix = new Span<byte>(Encoding.ASCII.GetBytes("*2\r\n$4\r\nECHO\r\n")),
-                Nil = new Span<byte>(Encoding.ASCII.GetBytes("$-1\r\n")),
-                Empty = new Span<byte>(Encoding.ASCII.GetBytes("$0\r\n\r\n"));
+            static readonly byte[]
+                prefix = Encoding.ASCII.GetBytes("*2\r\n$4\r\nECHO\r\n"),
+                Nil = Encoding.ASCII.GetBytes("$-1\r\n"),
+                Empty = Encoding.ASCII.GetBytes("$0\r\n\r\n");
 
             static unsafe void WriteString(ref WritableBuffer output, object content)
             {
@@ -251,8 +254,7 @@ namespace RedisCore
             private static unsafe void WriteLengthPrefix(ref WritableBuffer output, uint len)
             {
                 output.Ensure(4); // "$x\r\n" is best case
-                *(byte*)output.Memory.UnsafePointer = (byte)'$';
-                output.CommitBytes(1);
+                output.Write(Dollar);
                 WritableBufferExtensions.WriteUInt64(ref output, len);
                 output.Write(CRLF);
             }
@@ -286,7 +288,7 @@ namespace RedisCore
                 var output = Output.Alloc();
                 foreach (var message in batch.Messages)
                 {
-                    lock(expectedReplies)
+                    lock (expectedReplies)
                     {
                         expectedReplies.Enqueue(message.GetMessage());
                     }
@@ -316,10 +318,10 @@ namespace RedisCore
                 WriteWithLockSync(ref message, parser, null, fireAndForget);
                 return default(TResult);
             }
-            
+
             ResultBox<TResult> source = ResultBox<TResult>.Get();
             TResult result;
-            lock(source.SyncLock)
+            lock (source.SyncLock)
             {
                 WriteWithLockSync(ref message, parser, source, fireAndForget);
                 result = source.WaitLocked();
@@ -377,7 +379,7 @@ namespace RedisCore
             WriteWithLockSync(ref message, parser, source, fireAndForget);
             return source?.Task ?? DefaultTask<TResult>.Instance;
         }
-        
+
         protected IWritableChannel Output => connection.Output;
         protected IReadableChannel Input => connection.Input;
         public void Dispose()
@@ -385,7 +387,7 @@ namespace RedisCore
             connection?.Dispose();
             connection = null;
         }
-        
+
         public bool IsConnected => connection != null;
         internal async void Connect(ClientChannelFactory factory, string location)
         {
