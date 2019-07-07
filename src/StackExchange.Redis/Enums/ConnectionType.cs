@@ -16,6 +16,10 @@
         /// <summary>
         /// A subscriber connection recieves unsolicted messages from the server as pub/sub events occur
         /// </summary>
-        Subscription
+        Subscription,
+        /// <summary>
+        /// A connection that will be used for blocking commands.
+        /// </summary>
+        Dedicated
     }
 }

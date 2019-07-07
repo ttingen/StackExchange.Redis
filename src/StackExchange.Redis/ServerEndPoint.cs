@@ -25,6 +25,8 @@ namespace StackExchange.Redis
 
     internal sealed partial class ServerEndPoint : IDisposable
     {
+        // TT_TODO: Investigate usage of Master and Slaves and how this
+        //          would potentially affect connectionPool usage.
         internal volatile ServerEndPoint Master;
         internal volatile ServerEndPoint[] Slaves = Array.Empty<ServerEndPoint>();
         private static readonly Regex nameSanitizer = new Regex("[^!-~]", RegexOptions.Compiled);
@@ -32,8 +34,7 @@ namespace StackExchange.Redis
         private readonly Hashtable knownScripts = new Hashtable(StringComparer.Ordinal);
 
         private int databases, writeEverySeconds;
-        private PhysicalBridge interactive, subscription;
-        private bool isDisposed;
+        private volatile PhysicalPool connectionPool;
         private ServerType serverType;
         private bool slaveReadOnly, isSlave;
         private volatile UnselectableFlags unselectableReasons;
@@ -41,8 +42,7 @@ namespace StackExchange.Redis
 
         internal void ResetNonConnected()
         {
-            interactive?.ResetNonConnected();
-            subscription?.ResetNonConnected();
+            connectionPool.ResetNonConnected();
         }
 
         public ServerEndPoint(ConnectionMultiplexer multiplexer, EndPoint endpoint)
@@ -63,6 +63,8 @@ namespace StackExchange.Redis
                 databases = 1;
                 serverType = ServerType.Twemproxy;
             }
+
+            connectionPool = new PhysicalPool(multiplexer, this);
         }
 
         public ClusterConfiguration ClusterConfiguration { get; private set; }
@@ -73,16 +75,18 @@ namespace StackExchange.Redis
 
         public bool HasDatabases => serverType == ServerType.Standalone;
 
-        public bool IsConnected => interactive?.IsConnected == true;
+        // TT_TODO: Investigate references to these properties.
+        public bool IsConnected => connectionPool.IsConnected;
 
-        public bool IsConnecting => interactive?.IsConnecting == true;
+        public bool IsConnecting => connectionPool.IsConnecting;
 
         internal Exception LastException
         {
             get
             {
-                var tmp1 = interactive;
-                var tmp2 = subscription;
+                // TT_TODO: Adjust this once we move to a true pool.
+                var tmp1 = connectionPool.Interactive;
+                var tmp2 = connectionPool.Subscription;
 
                 //check if subscription endpoint has a better lastexception
                 if (tmp2?.LastException != null && tmp2.LastException.Data.Contains("Redis-FailureType") && !tmp2.LastException.Data["Redis-FailureType"].ToString().Equals(nameof(ConnectionFailureType.UnableToConnect)))
@@ -97,7 +101,7 @@ namespace StackExchange.Redis
         {
             get
             {
-                var tmp = interactive;
+                var tmp = connectionPool.Interactive;
                 return tmp.ConnectionState;
             }
         }
@@ -108,10 +112,11 @@ namespace StackExchange.Redis
         {
             get
             {
+                // TT_TODO: Add single OperationCount to the PhysicalPool class.
                 long total = 0;
-                var tmp = interactive;
+                var tmp = connectionPool.Interactive;
                 if (tmp != null) total += tmp.OperationCount;
-                tmp = subscription;
+                tmp = connectionPool.Subscription;
                 if (tmp != null) total += tmp.OperationCount;
                 return total;
             }
@@ -146,43 +151,15 @@ namespace StackExchange.Redis
 
         public void Dispose()
         {
-            isDisposed = true;
-            var tmp = interactive;
-            interactive = null;
-            tmp?.Dispose();
-
-            tmp = subscription;
-            subscription = null;
-            tmp?.Dispose();
+            connectionPool.Dispose();
         }
 
+        // TT_TODO: Build errors occur without the ServerEndPoint.GetBridge methods.
         public PhysicalBridge GetBridge(ConnectionType type, bool create = true, LogProxy log = null)
-        {
-            if (isDisposed) return null;
-            switch (type)
-            {
-                case ConnectionType.Interactive:
-                    return interactive ?? (create ? interactive = CreateBridge(ConnectionType.Interactive, log) : null);
-                case ConnectionType.Subscription:
-                    return subscription ?? (create ? subscription = CreateBridge(ConnectionType.Subscription, log) : null);
-            }
-            return null;
-        }
+            => connectionPool.GetBridge(type, create, log);
 
         public PhysicalBridge GetBridge(RedisCommand command, bool create = true)
-        {
-            if (isDisposed) return null;
-            switch (command)
-            {
-                case RedisCommand.SUBSCRIBE:
-                case RedisCommand.UNSUBSCRIBE:
-                case RedisCommand.PSUBSCRIBE:
-                case RedisCommand.PUNSUBSCRIBE:
-                    return subscription ?? (create ? subscription = CreateBridge(ConnectionType.Subscription, null) : null);
-                default:
-                    return interactive ?? (create ? interactive = CreateBridge(ConnectionType.Interactive, null) : null);
-            }
-        }
+            => connectionPool.GetBridge(command, create);
 
         public RedisFeatures GetFeatures() => new RedisFeatures(version);
 
@@ -234,13 +211,14 @@ namespace StackExchange.Redis
         public override string ToString() => Format.ToString(EndPoint);
 
         [Obsolete("prefer async")]
-        public WriteResult TryWriteSync(Message message) => GetBridge(message.Command)?.TryWriteSync(message, isSlave) ?? WriteResult.NoConnectionAvailable;
+        public WriteResult TryWriteSync(Message message) => connectionPool.GetBridge(message.Command)?.TryWriteSync(message, isSlave) ?? WriteResult.NoConnectionAvailable;
 
-        public ValueTask<WriteResult> TryWriteAsync(Message message) => GetBridge(message.Command)?.TryWriteAsync(message, isSlave) ?? new ValueTask<WriteResult>(WriteResult.NoConnectionAvailable);
+        public ValueTask<WriteResult> TryWriteAsync(Message message) => connectionPool.GetBridge(message.Command)?.TryWriteAsync(message, isSlave) ?? new ValueTask<WriteResult>(WriteResult.NoConnectionAvailable);
 
         internal void Activate(ConnectionType type, LogProxy log)
         {
-            GetBridge(type, true, log);
+            // TT_TODO: Replace with "ActivatePool" or something similar.
+            connectionPool.GetBridge(type, true, log);
         }
 
         internal void AddScript(string script, byte[] hash)
@@ -328,7 +306,7 @@ namespace StackExchange.Redis
         {
             try
             {
-                var tmp = GetBridge(connectionType, create: false);
+                var tmp = connectionPool.GetBridge(connectionType, create: false);
                 if (tmp == null || !tmp.IsConnected || !Multiplexer.CommandMap.IsAvailable(RedisCommand.QUIT))
                 {
                     return Task.CompletedTask;
@@ -372,15 +350,15 @@ namespace StackExchange.Redis
         internal ServerCounters GetCounters()
         {
             var counters = new ServerCounters(EndPoint);
-            interactive?.GetCounters(counters.Interactive);
-            subscription?.GetCounters(counters.Subscription);
+            connectionPool.Interactive?.GetCounters(counters.Interactive);
+            connectionPool.Subscription?.GetCounters(counters.Subscription);
             return counters;
         }
 
         internal void GetOutstandingCount(RedisCommand command, out int inst, out int qs, out long @in, out int qu, out bool aw, out long toRead, out long toWrite,
             out BacklogStatus bs, out PhysicalConnection.ReadStatus rs, out PhysicalConnection.WriteStatus ws)
         {
-            var bridge = GetBridge(command, false);
+            var bridge = connectionPool.GetBridge(command, false);
             if (bridge == null)
             {
                 inst = qs = qu = 0;
@@ -400,9 +378,9 @@ namespace StackExchange.Redis
         {
             var sb = new StringBuilder();
             sb.Append("Circular op-count snapshot; int:");
-            interactive?.AppendProfile(sb);
+            connectionPool.Interactive?.AppendProfile(sb);
             sb.Append("; sub:");
-            subscription?.AppendProfile(sb);
+            connectionPool.Subscription?.AppendProfile(sb);
             return sb.ToString();
         }
 
@@ -423,7 +401,7 @@ namespace StackExchange.Redis
 
         internal string GetStormLog(RedisCommand command)
         {
-            var bridge = GetBridge(command);
+            var bridge = connectionPool.GetBridge(command);
             return bridge?.GetStormLog();
         }
 
@@ -464,7 +442,7 @@ namespace StackExchange.Redis
 
         internal bool IsSelectable(RedisCommand command, bool allowDisconnected = false)
         {
-            var bridge = unselectableReasons == 0 ? GetBridge(command, false) : null;
+            var bridge = unselectableReasons == 0 ? connectionPool.GetBridge(command, false) : null;
             return bridge != null && (allowDisconnected || bridge.IsConnected);
         }
 
@@ -495,6 +473,8 @@ namespace StackExchange.Redis
                 connection.RecordConnectionFailed(ConnectionFailureType.InternalFailure, ex);
             }
         }
+
+        // TT_TODO: Investigate references.
         internal void OnFullyEstablished(PhysicalConnection connection)
         {
             try
@@ -503,7 +483,7 @@ namespace StackExchange.Redis
                 var bridge = connection.BridgeCouldBeNull;
                 if (bridge != null)
                 {
-                    if (bridge == subscription)
+                    if (bridge == connectionPool.Subscription)
                     {
                         Multiplexer.ResendSubscriptions(this);
                     }
@@ -533,7 +513,7 @@ namespace StackExchange.Redis
             lastInfoReplicationCheckTicks = Environment.TickCount;
             PhysicalBridge bridge;
             if (version >= RedisFeatures.v2_8_0 && Multiplexer.CommandMap.IsAvailable(RedisCommand.INFO)
-                && (bridge = GetBridge(ConnectionType.Interactive, false)) != null)
+                && (bridge = connectionPool.GetBridge(ConnectionType.Interactive, false)) != null)
             {
 #pragma warning disable CS0618
                 var msg = Message.Create(-1, CommandFlags.FireAndForget | CommandFlags.HighPriority | CommandFlags.NoRedirect, RedisCommand.INFO, RedisLiterals.replication);
@@ -548,6 +528,8 @@ namespace StackExchange.Redis
         private int lastInfoReplicationCheckTicks;
 
         private int _heartBeatActive;
+
+        // TT_TODO: move to connection pool.
         internal void OnHeartbeat()
         {
             // don't overlap operations on an endpoint
@@ -555,8 +537,8 @@ namespace StackExchange.Redis
             {
                 try
                 {
-                    interactive?.OnHeartbeat(false);
-                    subscription?.OnHeartbeat(false);
+                    connectionPool.Interactive?.OnHeartbeat(false);
+                    connectionPool.Subscription?.OnHeartbeat(false);
                 }
                 catch (Exception ex)
                 {
@@ -584,7 +566,7 @@ namespace StackExchange.Redis
         {
             var source = TaskResultBox<T>.Create(out var tcs, asyncState);
             message.SetSource(processor, source);
-            if (bridge == null) bridge = GetBridge(message.Command);
+            if (bridge == null) bridge = connectionPool.GetBridge(message.Command);
 
             WriteResult result;
             if (bridge == null)
@@ -614,15 +596,15 @@ namespace StackExchange.Redis
                 message.SetSource(processor, null);
                 Multiplexer.Trace("Enqueue: " + message);
 #pragma warning disable CS0618
-                (bridge ?? GetBridge(message.Command)).TryWriteSync(message, isSlave);
+                (bridge ?? connectionPool.GetBridge(message.Command)).TryWriteSync(message, isSlave);
 #pragma warning restore CS0618
             }
         }
 
         internal void ReportNextFailure()
         {
-            interactive?.ReportNextFailure();
-            subscription?.ReportNextFailure();
+            connectionPool.Interactive?.ReportNextFailure();
+            connectionPool.Subscription?.ReportNextFailure();
         }
 
         internal Task<bool> SendTracer(LogProxy log = null)
@@ -640,9 +622,9 @@ namespace StackExchange.Redis
             if (databases > 0) sb.Append("; ").Append(databases).Append(" databases");
             if (writeEverySeconds > 0)
                 sb.Append("; keep-alive: ").Append(TimeSpan.FromSeconds(writeEverySeconds));
-            var tmp = interactive;
+            var tmp = connectionPool.Interactive;
             sb.Append("; int: ").Append(tmp?.ConnectionState.ToString() ?? "n/a");
-            tmp = subscription;
+            tmp = connectionPool.Subscription;
             if (tmp == null)
             {
                 sb.Append("; sub: n/a");
@@ -676,7 +658,7 @@ namespace StackExchange.Redis
                 if (connection == null)
                 {
                     Multiplexer.Trace("Enqueue: " + message);
-                    result = GetBridge(message.Command).TryWriteAsync(message, isSlave);
+                    result = connectionPool.GetBridge(message.Command).TryWriteAsync(message, isSlave);
                 }
                 else
                 {
@@ -707,7 +689,7 @@ namespace StackExchange.Redis
                 {
                     Multiplexer.Trace("Enqueue: " + message);
 #pragma warning disable CS0618
-                    GetBridge(message.Command).TryWriteSync(message, isSlave);
+                    connectionPool.GetBridge(message.Command).TryWriteSync(message, isSlave);
 #pragma warning restore CS0618
                 }
                 else
@@ -818,8 +800,8 @@ namespace StackExchange.Redis
         /// </summary>
         internal void SimulateConnectionFailure()
         {
-            interactive?.SimulateConnectionFailure();
-            subscription?.SimulateConnectionFailure();
+            connectionPool.Interactive?.SimulateConnectionFailure();
+            connectionPool.Subscription?.SimulateConnectionFailure();
         }
     }
 }
